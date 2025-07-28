@@ -1,0 +1,222 @@
+version: '3.8'
+
+services:
+  # Caddy Configuration Generator
+  caddy-config:
+    image: alpine:latest
+    container_name: keygen-caddy-config
+    volumes:
+      - ./:/workspace
+    environment:
+      - HOST_DOMAIN=${HOST_DOMAIN:-api.efret.io}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-dan@khosa.co}
+    command: |
+      sh -c '
+        # Generate Caddyfile with environment variables
+        cat > /workspace/Caddyfile << EOF
+        {
+            email ${ADMIN_EMAIL}
+        }
+
+        ${HOST_DOMAIN} {
+            encode gzip
+            
+            header {
+                Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                X-XSS-Protection "1; mode=block"
+                Referrer-Policy "strict-origin-when-cross-origin"
+                X-API-Version "v1"
+                Cache-Control "no-store, no-cache, must-revalidate"
+                -Server
+                defer
+            }
+
+            reverse_proxy keygen-web:3000 {
+                health_uri /v1/health
+                health_interval 30s
+                health_timeout 5s
+                
+                header_up X-Real-IP {remote_host}
+                header_up X-Forwarded-For {remote_host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up X-Forwarded-Host {host}
+                
+                transport http {
+                    dial_timeout 10s
+                    response_header_timeout 30s
+                    keepalive 30s
+                }
+            }
+
+            log {
+                output file /var/log/caddy/keygen.log {
+                    roll_size 100mb
+                    roll_keep 5
+                    roll_keep_for 720h
+                }
+                format json
+                level INFO
+            }
+        }
+
+        health.${HOST_DOMAIN} {
+            handle /keygen {
+                reverse_proxy keygen-web:3000/v1/health
+            }
+            
+            handle {
+                respond "OK" 200
+            }
+        }
+        EOF
+        
+        echo "Caddyfile generated successfully!"
+        echo "Generated Caddyfile content:"
+        echo "================================================"
+        cat /workspace/Caddyfile
+        echo "================================================"
+      '
+    profiles:
+      - config
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:13.14-alpine
+    container_name: keygen-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: keygen
+      POSTGRES_PASSWORD: keygen_password
+      POSTGRES_DB: keygen_production
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - keygen_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keygen -d keygen_production"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Redis Cache
+  redis:
+    image: redis:7.2.3-alpine3.18
+    container_name: keygen-redis
+    restart: unless-stopped
+    command: redis-server --save 20 1 --loglevel warning --requirepass ""
+    volumes:
+      - redis_data:/data
+    networks:
+      - keygen_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Keygen Setup (one-time initialization)
+  setup:
+    image: keygen/api:latest
+    container_name: keygen-setup
+    env_file: .env
+    command: setup
+    networks:
+      - keygen_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    profiles:
+      - setup
+
+  # Keygen Web Server
+  keygen-web:
+    image: keygen/api:latest
+    container_name: keygen-web
+    restart: unless-stopped
+    env_file: .env
+    command: web
+    expose:
+      - "3000"
+    networks:
+      - keygen_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # Keygen Worker (background jobs)
+  keygen-worker:
+    image: keygen/api:latest
+    container_name: keygen-worker
+    restart: unless-stopped
+    env_file: .env
+    command: worker
+    networks:
+      - keygen_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keygen-web:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # Caddy Reverse Proxy
+  caddy:
+    image: caddy:2-alpine
+    container_name: keygen-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    networks:
+      - keygen_network
+    depends_on:
+      keygen-web:
+        condition: service_healthy
+
+networks:
+  keygen_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+  caddy_logs:
+    driver: local
